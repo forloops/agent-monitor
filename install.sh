@@ -44,49 +44,21 @@ EOF
 codesign --force --sign - "$APP" 2>/dev/null || echo "    (codesign unavailable; continuing unsigned)"
 rm -f "$REPO_DIR/AgentMonitor"   # pre-bundle binary from older installs
 
-echo "==> Installing Codex hook"
-mkdir -p "$HOME/.codex/hooks"
-if ! cmp -s "$REPO_DIR/codex/codex-status" "$CODEX_HOOK" 2>/dev/null; then
-    cp "$REPO_DIR/codex/codex-status" "$CODEX_HOOK"
-    chmod +x "$CODEX_HOOK"
+HOOK_DIR="$HOME/.agent-monitor"
+HOOK="$HOOK_DIR/agent-status"
+
+echo "==> Installing agent hook"
+mkdir -p "$HOOK_DIR/sessions"
+if ! cmp -s "$REPO_DIR/hooks/agent-status" "$HOOK" 2>/dev/null; then
+    cp "$REPO_DIR/hooks/agent-status" "$HOOK"
+    chmod +x "$HOOK"
     echo "    Hook script changed: start 'codex' once and accept the hooks review"
     echo "    (Trust all and continue), or Codex will silently skip it."
 else
     echo "    Hook script unchanged."
 fi
-
-if [ ! -f "$HOME/.codex/hooks.json" ]; then
-    cat > "$HOME/.codex/hooks.json" <<EOF
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "PostToolUse": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "PermissionRequest": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "Interrupt": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "$CODEX_HOOK", "timeout": 10 }] }
-    ]
-  }
-}
-EOF
-    echo "    Wrote ~/.codex/hooks.json"
-else
-    echo "    ~/.codex/hooks.json already exists; left untouched."
-fi
+rm -f "$HOME/.codex/hooks/codex-status"   # pre-unified hook from older installs
+python3 "$REPO_DIR/hooks/register.py" install "$HOOK"
 
 echo "==> Installing LaunchAgent"
 mkdir -p "$HOME/Library/LaunchAgents"

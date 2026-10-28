@@ -1,14 +1,19 @@
-// AgentMonitor — menu bar dots for Claude Code and Codex sessions in iTerm2.
+// AgentMonitor — menu bar dots for Claude Code and Codex sessions.
 //
-// One dot per agent session, fed by iTerm2's per-session status store:
+// One dot per agent session. Two sources, merged each poll:
+//   1. ~/.agent-monitor/sessions/*.json — written by hooks/agent-status from
+//      Claude Code and Codex lifecycle hooks; works in any terminal.
+//   2. iTerm2's per-session status store (via `it2`) — covers Claude Code
+//      sessions that only have iTerm2's own cc-status hook installed.
+//
 //   green  = working
 //   yellow = attention needed (permission prompt / waiting on you)
 //   red    = stopped (done, idle, or error)
 //   orange = stalled (working, but the terminal went quiet or the turn
 //            has run longer than the configured limit)
 //
-// Polls `it2 session list` + `it2 session get-status` every 2 seconds.
-// Clicking an agent in the menu focuses its iTerm2 session.
+// Polls every 2 seconds. Clicking an agent focuses its terminal session
+// (iTerm2, Terminal.app, kitty, WezTerm, tmux pane) or at least its app.
 //
 // Build: ./install.sh (wraps the binary in AgentMonitor.app — notifications
 // need a bundle identifier, so running the bare binary disables them).
@@ -170,26 +175,22 @@ let noOutputStallInterval: TimeInterval = 90
 // MARK: - Agents
 
 struct Agent {
-    let sessionID: String
+    let sessionID: String   // "file:<record>" or "it2:<iTerm2 session id>"
     let status: String      // working | waiting | done | idle | error
-    let detail: String?
-    let path: String
-    let jobName: String
+    let agentName: String   // claude | codex | ...
+    let path: String        // working directory
     let sortKey: String
     let tty: String
     let lastOutput: Date?   // tty mtime; nil when the tty couldn't be stat'ed
+    /// Terminal identity from the hook: bundle_id, iterm_session, tmux,
+    /// tmux_pane, kitty_window, kitty_listen, wezterm_pane (all optional).
+    let terminal: [String: String]
     var since = Date()      // when the current status was first observed
     var stallReason: String?   // non-nil => shown as stalled
 
     var projectName: String {
         let name = (path as NSString).lastPathComponent
         return name.isEmpty ? "unknown" : name
-    }
-    // "codex" comes through the detail field (set by our hook); Claude Code
-    // sessions are identified by their foreground job name.
-    var agentName: String {
-        if let detail, !detail.isEmpty { return detail }
-        return jobName.isEmpty ? "agent" : jobName
     }
     var state: DotState { stallReason == nil ? DotState(status: status) : .stalled }
     var dotColor: NSColor { ColorStore.color(for: state) }
@@ -223,10 +224,24 @@ struct Agent {
 let plainShells: Set<String> = ["zsh", "bash", "fish", "sh", "tcsh", "csh", "ksh", "nu",
                                 "-zsh", "-bash", "login"]
 
-/// Runs it2 synchronously (call off the main thread) and returns stdout, or nil on failure.
-func runIt2(_ args: [String]) -> Data? {
+let storeDir = ("~/.agent-monitor/sessions" as NSString).expandingTildeInPath
+
+/// Finds a CLI tool: absolute paths as-is, otherwise common bin dirs and the
+/// terminal apps' bundles (the app's own PATH under launchd is minimal).
+func resolveTool(_ name: String) -> String? {
+    if name.hasPrefix("/") { return name }
+    let dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+                "/Applications/kitty.app/Contents/MacOS",
+                "/Applications/WezTerm.app/Contents/MacOS"]
+    return dirs.map { "\($0)/\(name)" }.first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+
+/// Runs a tool synchronously (call off the main thread); stdout, or nil on failure.
+@discardableResult
+func runTool(_ tool: String, _ args: [String]) -> Data? {
+    guard let exe = resolveTool(tool) else { return nil }
     let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: it2Path)
+    proc.executableURL = URL(fileURLWithPath: exe)
     proc.arguments = args
     let out = Pipe()
     proc.standardOutput = out
@@ -237,7 +252,56 @@ func runIt2(_ args: [String]) -> Data? {
     return proc.terminationStatus == 0 ? data : nil
 }
 
-func pollAgents() -> [Agent]? {
+func runIt2(_ args: [String]) -> Data? { runTool(it2Path, args) }
+
+func ttyLastOutput(_ tty: String) -> Date? {
+    guard !tty.isEmpty else { return nil }
+    return (try? FileManager.default.attributesOfItem(atPath: tty))?[.modificationDate] as? Date
+}
+
+func processAlive(_ pid: Int32) -> Bool {
+    if kill(pid, 0) == 0 { return true }
+    return errno == EPERM
+}
+
+/// Source 1: records written by hooks/agent-status. A record is live while
+/// its agent pid runs; dead ones are deleted here so the store stays tidy.
+func pollFileStore() -> [Agent] {
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: storeDir) else { return [] }
+    var agents: [Agent] = []
+    for name in names where name.hasSuffix(".json") {
+        let file = storeDir + "/" + name
+        guard let data = FileManager.default.contents(atPath: file),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = obj["status"] as? String,
+              let pid = (obj["pid"] as? NSNumber)?.int32Value
+        else { continue }
+        if !processAlive(pid) {
+            try? FileManager.default.removeItem(atPath: file)
+            continue
+        }
+        let tty = obj["tty"] as? String ?? ""
+        let terminal = (obj["terminal"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
+        agents.append(Agent(
+            sessionID: "file:\(name)",
+            status: status,
+            agentName: obj["agent"] as? String ?? "agent",
+            path: obj["cwd"] as? String ?? "",
+            sortKey: "0/\(terminal["bundle_id"] ?? "~")/\(tty)/\(name)",
+            tty: tty,
+            lastOutput: ttyLastOutput(tty),
+            terminal: terminal
+        ))
+    }
+    return agents
+}
+
+func iterm2Running() -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.googlecode.iterm2").isEmpty
+}
+
+/// Source 2: iTerm2's status store. nil = iTerm2's API unreachable.
+func pollIterm2() -> [Agent]? {
     guard let listData = runIt2(["session", "list", "--json", "--format",
                                  "\\(session.path)\t\\(session.jobName)"]),
           let sessions = try? JSONSerialization.jsonObject(with: listData) as? [[String: Any]]
@@ -260,20 +324,43 @@ func pollAgents() -> [Agent]? {
         let tabID = session["tab_id"] as? String ?? ""
         // iTerm2 emits the path as "\/dev\/ttys000" (an extra backslash per slash).
         let tty = (session["tty"] as? String ?? "").replacingOccurrences(of: "\\", with: "")
-        let lastOutput = tty.isEmpty ? nil :
-            (try? FileManager.default.attributesOfItem(atPath: tty))?[.modificationDate] as? Date
+        // "codex" comes through the detail field (set by our hook); Claude Code
+        // sessions are identified by their foreground job name.
+        let detail = statusObj["detail"] as? String ?? ""
+        let agentName = !detail.isEmpty ? detail : (jobName.isEmpty ? "agent" : jobName)
         agents.append(Agent(
-            sessionID: id,
+            sessionID: "it2:\(id)",
             status: status,
-            detail: statusObj["detail"] as? String,
+            agentName: agentName,
             path: path,
-            jobName: jobName,
-            sortKey: "\(windowID)/\(tabID)/\(id)",
+            sortKey: "1/\(windowID)/\(tabID)/\(id)",
             tty: tty,
-            lastOutput: lastOutput
+            lastOutput: ttyLastOutput(tty),
+            terminal: ["bundle_id": "com.googlecode.iterm2", "iterm_session": id]
         ))
     }
-    return agents.sorted { $0.sortKey < $1.sortKey }
+    return agents
+}
+
+struct PollResult {
+    var agents: [Agent]
+    var iterm2Unreachable: Bool   // iTerm2 is running but its API didn't answer
+}
+
+func pollAgents() -> PollResult {
+    var agents = pollFileStore()
+    var unreachable = false
+    if iterm2Running() {
+        if let fromIterm2 = pollIterm2() {
+            // A session our hook already reports must not show twice.
+            let claimed = Set(agents.compactMap { $0.terminal["iterm_session"] })
+            agents += fromIterm2.filter { !claimed.contains($0.terminal["iterm_session"] ?? "") }
+        } else {
+            unreachable = true
+        }
+    }
+    return PollResult(agents: agents.sorted { $0.sortKey < $1.sortKey },
+                      iterm2Unreachable: unreachable)
 }
 
 // MARK: - Notifications
@@ -568,7 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
     var agents: [Agent] = []          // everything the last poll returned
-    var iterm2Reachable = true
+    var iterm2Unreachable = false
     var lastFocused: String?          // session the hotkey focused most recently
     let pollQueue = DispatchQueue(label: "agent-monitor.poll")
     let settings = SettingsWindowController()
@@ -612,8 +699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let result = pollAgents()
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.iterm2Reachable = (result != nil)
-                self.agents = self.track(result ?? [])
+                self.iterm2Unreachable = result.iterm2Unreachable
+                self.agents = self.track(result.agents)
                 self.render()
             }
         }
@@ -704,9 +791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let shown = visibleAgents
         let hidden = agents.count - shown.count
 
-        if !iterm2Reachable {
-            menu.addItem(disabledItem("iTerm2 not reachable"))
-        } else if shown.isEmpty {
+        if shown.isEmpty {
             menu.addItem(disabledItem("No active agent sessions"))
         } else {
             let now = Date()
@@ -737,6 +822,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if hidden > 0 {
             menu.addItem(disabledItem("\(hidden) stopped session\(hidden == 1 ? "" : "s") hidden"))
+        }
+        if iterm2Unreachable {
+            menu.addItem(disabledItem("iTerm2 not reachable — enable its Python API"))
         }
 
         menu.addItem(.separator())
@@ -786,13 +874,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         focus(sessionID: candidates[index].sessionID)
     }
 
+    /// Focuses the agent's pane/tab where the terminal offers a way, then
+    /// brings the terminal app forward.
     func focus(sessionID: String) {
         lastFocused = sessionID
+        guard let agent = agents.first(where: { $0.sessionID == sessionID }) else { return }
+        let t = agent.terminal
         pollQueue.async {
-            _ = runIt2(["session", "focus", "-s", sessionID])
+            if let tmux = t["tmux"], let pane = t["tmux_pane"] {
+                // $TMUX is "socket,pid,index"; the pane id is unique per server.
+                let socket = tmux.components(separatedBy: ",").first ?? ""
+                runTool("tmux", ["-S", socket, "select-window", "-t", pane])
+                runTool("tmux", ["-S", socket, "select-pane", "-t", pane])
+            }
+            if let session = t["iterm_session"] {
+                _ = runIt2(["session", "focus", "-s", session])
+            } else if t["bundle_id"] == "com.apple.Terminal", !agent.tty.isEmpty {
+                runTool("/usr/bin/osascript", ["-e", """
+                    tell application "Terminal"
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                if tty of t is "\(agent.tty)" then
+                                    set selected tab of w to t
+                                    set index of w to 1
+                                    return
+                                end if
+                            end repeat
+                        end repeat
+                    end tell
+                    """])
+            } else if let window = t["kitty_window"] {
+                var args = ["@"]
+                if let listen = t["kitty_listen"] { args += ["--to", listen] }
+                runTool("kitty", args + ["focus-window", "--match", "id:\(window)"])
+            } else if let pane = t["wezterm_pane"] {
+                runTool("wezterm", ["cli", "activate-pane", "--pane-id", pane])
+            }
         }
-        if let iterm = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.googlecode.iterm2") {
-            NSWorkspace.shared.openApplication(at: iterm, configuration: NSWorkspace.OpenConfiguration())
+        let bundleID = t["bundle_id"] ?? "com.googlecode.iterm2"
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
     }
 }

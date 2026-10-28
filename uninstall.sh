@@ -7,9 +7,10 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null && echo "Stopped AgentMonitor."
 rm -f "$PLIST" && echo "Removed LaunchAgent plist."
-rm -f "$HOME/.codex/hooks/codex-status" && echo "Removed Codex hook script."
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$REPO_DIR/hooks/register.py" remove "$HOME/.agent-monitor/agent-status"
+rm -f "$HOME/.codex/hooks/codex-status"
+rm -rf "$HOME/.agent-monitor" && echo "Removed ~/.agent-monitor (hook + session store)."
 
 echo
-echo "Left in place (remove manually if you no longer want them):"
-echo "  ~/.codex/hooks.json          (Codex hook registration)"
-echo "  ~/.claude/settings.json      (iTerm2 cc-status hooks for Claude Code)"
+echo "Left in place: iTerm2's own cc-status entries in ~/.claude/settings.json."

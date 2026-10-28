@@ -1,7 +1,8 @@
 # Agent Monitor
 
 macOS menu bar app showing one colored dot per active coding agent — **Claude Code**
-and **Codex CLI** sessions running in iTerm2.
+and **Codex CLI** sessions in any terminal (iTerm2, Terminal.app, Ghostty, kitty,
+WezTerm, Warp, VS Code, …).
 
 ![Menu bar showing an agent status dot](screenshot.png)
 
@@ -17,8 +18,10 @@ in Settings).
 
 Click the dots for a dropdown listing each agent (`project · claude — working  4m`,
 `project · codex — waiting  12s`, …) with how long it has been in that state.
-Clicking an agent focuses its iTerm2 session and brings iTerm2 forward; while the
-menu is open, keys `1`–`9` pick a row.
+Clicking an agent brings its terminal forward and, where the terminal offers a
+way, selects the exact pane: iTerm2 sessions, Terminal.app tabs, kitty windows
+(needs `allow_remote_control`), WezTerm panes, and tmux panes. While the menu is
+open, keys `1`–`9` pick a row.
 
 - **Notifications**: a macOS notification when an agent needs attention or
   finishes a turn (each togglable in Settings). Clicking it focuses the session.
@@ -43,54 +46,49 @@ inspect with `defaults read AgentMonitor`, wipe with `defaults delete AgentMonit
 
 ## How it works
 
-The app installs no hooks of its own. Both agents push their state into iTerm2's
-generic per-session status store (`it2 session set-status`), and the app polls it:
+Both agents run `hooks/agent-status` (installed to `~/.agent-monitor/`) from
+their lifecycle hooks. On each event it writes one JSON record per agent
+session to `~/.agent-monitor/sessions/`, and the app reads that directory
+every 2 seconds:
 
 ```
-Claude Code ── cc-status (bundled with iTerm2, ──┐
-               wired in ~/.claude/settings.json) │
-                                                 ├──▶ iTerm2 status store ──▶ AgentMonitor
-Codex CLI ──── codex/codex-status (this repo, ───┘         (per session)       (menu bar)
-               wired in ~/.codex/hooks.json)
+Claude Code ── hooks in ~/.claude/settings.json ──┐
+                                                  ├──▶ ~/.agent-monitor/sessions/*.json ──▶ AgentMonitor
+Codex CLI ──── hooks in ~/.codex/hooks.json ──────┘        (one file per session)          (menu bar)
 ```
 
-Every 2 seconds the app runs, via iTerm2's bundled CLI:
+A record holds the status, working directory, the agent's PID and tty, and the
+terminal's identity (`__CFBundleIdentifier`, `ITERM_SESSION_ID`, `TMUX_PANE`,
+`KITTY_WINDOW_ID`, `WEZTERM_PANE`, …) so the app can focus it later. A record
+is live while its PID is running; `SessionEnd` deletes it and the app prunes
+records whose process is gone.
 
-```
-it2 session list --json          # all sessions + working directory + foreground job
-it2 session get-status -s <id>   # {"status": "working|waiting|done|idle|error", ...}
-```
-
-A session gets a dot only if an agent has registered a status for it. Sessions
-whose foreground job has dropped back to a plain shell are skipped — the agent
-exited, so its stale status is ignored.
+iTerm2 is also read as a second source (`it2 session list` / `get-status`),
+which picks up Claude Code sessions that only have iTerm2's own `cc-status`
+hook, and the Codex hook still pushes status into iTerm2's store so iTerm2's
+UI shows Codex too. Sessions reported by both sources are shown once.
 
 ### Status mapping
 
-| Agent event                                | iTerm2 status | Dot |
-|--------------------------------------------|---------------|-----|
-| prompt submitted, tool ran, compaction     | `working`     | 🟢  |
-| permission requested                       | `waiting`     | 🟡  |
-| turn finished                              | `done`        | 🔴  |
-| session start/end, interrupted             | `idle`        | 🔴  |
-| failure                                    | `error`       | 🔴  |
+| Agent event                                     | status    | Dot |
+|-------------------------------------------------|-----------|-----|
+| prompt submitted, tool ran, compaction          | `working` | 🟢  |
+| permission requested, elicitation               | `waiting` | 🟡  |
+| turn finished                                   | `done`    | 🔴  |
+| session start, interrupted, idle prompt         | `idle`    | 🔴  |
+| failure                                         | `error`   | 🔴  |
 
 The status→state mapping lives in `DotState(status:)` at the top of
-`AgentMonitor.swift` (colors themselves come from `ColorStore`, overridable in
-Settings); the Codex event→status mapping in `codex/codex-status`.
+`AgentMonitor.swift`; the event→status tables for each agent are at the top of
+`hooks/agent-status`.
 
 ## Requirements
 
 - macOS with Xcode Command Line Tools (`swiftc`)
-- iTerm2 (both agents must run inside it — that's where the status store lives),
-  with its Python API enabled (Settings → General → Magic → Enable Python API),
-  which the `it2` CLI uses
-- For Claude Code: iTerm2's Claude Code integration — the `cc-status` utility
-  bundled with iTerm2, registered for every Claude Code hook event in
-  `~/.claude/settings.json`. Check that file for `cc-status` entries; if they're
-  missing, look for the Claude Code / AI integration option in your iTerm2
-  version's settings.
-- For Codex: Codex CLI with lifecycle hooks support
+- Claude Code and/or Codex CLI with lifecycle hooks support
+- Optional: iTerm2 with its Python API enabled (Settings → General → Magic →
+  Enable Python API) for exact session focusing and for the iTerm2 status
+  source
 
 Verified against iTerm2 3.7.6, Codex CLI 0.160.0, and Claude Code as of
 October 2026.
@@ -101,13 +99,11 @@ October 2026.
 ./install.sh
 ```
 
-This builds `AgentMonitor.app`, installs the Codex hook (`~/.codex/hooks/codex-status` +
-`~/.codex/hooks.json`), and registers a LaunchAgent so the app starts at login.
-
-If you already have a `~/.codex/hooks.json`, the installer leaves it untouched —
-merge the `codex-status` entries in yourself (register it for `SessionStart`,
-`UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `Interrupt`,
-and `SessionEnd`).
+This builds `AgentMonitor.app`, installs the hook to `~/.agent-monitor/agent-status`,
+registers it in `~/.claude/settings.json` and `~/.codex/hooks.json` (existing
+entries are preserved; a one-time `.bak` of each file is kept), and registers a
+LaunchAgent so the app starts at login. Already-running agent sessions pick up
+the hook when restarted.
 
 ### Codex one-time trust step
 
@@ -136,26 +132,32 @@ launchctl kickstart -k gui/$UID/com.forloops.agent-monitor     # just restart
 - **"iTerm2 not reachable" while iTerm2 is running**: enable iTerm2's Python API
   (Settings → General → Magic → Enable Python API) and approve the connection if
   iTerm2 prompts for it.
-- **Claude session shows no dot**: confirm iTerm2's cc-status hooks exist in
-  `~/.claude/settings.json` and the session runs inside iTerm2.
-- **Codex session shows no dot**: check `/tmp/agent-monitor-codex.log` — if it's
-  empty while Codex runs, the hook isn't trusted yet (see the trust step above).
-- **Inspect a session's stored status directly**:
-  `it2 session get-status -s <session-id>` (ids from `it2 session list`).
+- **A session shows no dot**: `/tmp/agent-monitor-hook.log` gets a line per
+  hook event. Nothing there while the agent runs means the hook isn't
+  registered (check `~/.claude/settings.json` / `~/.codex/hooks.json` for
+  `agent-status`) or, for Codex, isn't trusted yet (see the trust step above).
+  Sessions started before `./install.sh` need a restart to load the hook.
+- **Inspect stored state directly**: `cat ~/.agent-monitor/sessions/*.json`.
+- **Clicking a row doesn't select the pane**: the app only activates the
+  terminal app unless it knows the pane — iTerm2 needs its Python API, kitty
+  needs `allow_remote_control yes`, Terminal.app needs the Automation permission
+  macOS prompts for on first use.
 
 ## Project layout
 
 ```
 AgentMonitor.swift    # the menu bar app (single file, no dependencies)
 AgentMonitor.app/     # built by install.sh (gitignored)
-codex/codex-status    # Codex lifecycle hook -> it2 session set-status
-install.sh            # build + install hook, hooks.json, LaunchAgent
-uninstall.sh          # remove LaunchAgent + Codex hook
+hooks/agent-status    # Claude Code + Codex lifecycle hook -> ~/.agent-monitor/sessions/
+hooks/register.py     # merges/removes the hook in both agents' hook configs
+install.sh            # build + install hook, register it, LaunchAgent
+uninstall.sh          # remove LaunchAgent, hook registrations, ~/.agent-monitor
 ```
 
 ## Limitations
 
-- iTerm2 only — sessions in other terminals won't appear.
+- Pane-level focusing is per-terminal; unsupported terminals just get their
+  app activated.
 - Status granularity is whatever the hooks report; there's no heartbeat beyond
   hook events, so a crashed agent process is caught by the foreground-job check
   rather than a timeout.
