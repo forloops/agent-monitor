@@ -35,8 +35,10 @@ the `codex-status` command into it for the events listed in the README.
 - The app must run from `AgentMonitor.app` (built by `install.sh`) for
   notifications to work; `UNUserNotificationCenter` needs a bundle identifier
   and the code no-ops without one. The bundle is gitignored; never commit it.
-- Status transitions (notifications, elapsed time, hide-stopped) are tracked
-  in-app from poll to poll — iTerm2's status store has no timestamps.
+- Status transitions (notifications, elapsed time, hide-stopped, stall timer)
+  are tracked in-app from poll to poll — iTerm2's status store has no
+  timestamps. The only external activity signal is the session tty's mtime
+  (updated on every terminal write), used for the "no output" stall check.
 
 ## Verifying
 

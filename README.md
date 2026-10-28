@@ -8,7 +8,12 @@ and **Codex CLI** sessions running in iTerm2.
 - 🟢 **green** — working
 - 🟡 **yellow** — attention needed (permission prompt / waiting on you)
 - 🔴 **red** — stopped (turn done, idle, interrupted, or error)
+- 🟠 **orange** — stalled (see below)
 - ○ gray hollow — no active agent sessions
+
+Each agent gets its own shape so you can tell them apart in the bar:
+**●** Claude Code, **◆** Codex, **■** anything else (switchable to all-circles
+in Settings).
 
 Click the dots for a dropdown listing each agent (`project · claude — working  4m`,
 `project · codex — waiting  12s`, …) with how long it has been in that state.
@@ -23,9 +28,16 @@ menu is open, keys `1`–`9` pick a row.
   in Settings.
 - **Hide stopped sessions**: Settings can age stopped (red) sessions out of
   the bar after 1–60 minutes; the dropdown shows how many are hidden.
+- **Stall detection**: a working agent turns orange, and you get a
+  notification, when either its terminal has printed nothing for 90 s (both
+  agents animate a spinner during a turn, so silence means the process is
+  wedged — detected via the tty's modification time) or the turn has run for
+  longer than a configurable limit (default 15 min, off/5–60 in Settings).
+  The dropdown says which: `— stalled (no output for 2m)` or
+  `— stalled (working for 22m)`.
 
 Dot colors are customizable: **Settings…** in the dropdown opens a window with a
-color well per state (working / attention needed / stopped) and a reset button.
+color well per state (working / attention needed / stopped / stalled) and a reset button.
 Changes apply immediately and persist across restarts (stored in `UserDefaults`;
 inspect with `defaults read AgentMonitor`, wipe with `defaults delete AgentMonitor`).
 

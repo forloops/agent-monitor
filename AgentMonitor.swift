@@ -4,6 +4,8 @@
 //   green  = working
 //   yellow = attention needed (permission prompt / waiting on you)
 //   red    = stopped (done, idle, or error)
+//   orange = stalled (working, but the terminal went quiet or the turn
+//            has run longer than the configured limit)
 //
 // Polls `it2 session list` + `it2 session get-status` every 2 seconds.
 // Clicking an agent in the menu focuses its iTerm2 session.
@@ -42,7 +44,7 @@ let pollInterval: TimeInterval = 2.0
 // MARK: - Dot states & colors
 
 enum DotState: String, CaseIterable {
-    case working, attention, stopped
+    case working, attention, stopped, stalled
 
     init(status: String) {
         switch status {
@@ -57,6 +59,7 @@ enum DotState: String, CaseIterable {
         case .working:   return "Working"
         case .attention: return "Attention needed"
         case .stopped:   return "Stopped"
+        case .stalled:   return "Stalled"
         }
     }
 
@@ -65,6 +68,7 @@ enum DotState: String, CaseIterable {
         case .working:   return .systemGreen
         case .attention: return .systemYellow
         case .stopped:   return .systemRed
+        case .stalled:   return .systemOrange
         }
     }
 
@@ -140,7 +144,28 @@ enum Prefs {
         set { d.set(newValue, forKey: "hide-stopped-after") }
     }
     static let hideStoppedChoices = [0, 1, 2, 5, 10, 30, 60]
+
+    /// A working agent counts as stalled after this many minutes without a
+    /// status change; 0 = off. The no-output check is independent of this.
+    static var stallAfterMinutes: Int {
+        get { d.object(forKey: "stall-after") as? Int ?? 15 }
+        set { d.set(newValue, forKey: "stall-after") }
+    }
+    static let stallChoices = [0, 5, 10, 15, 30, 60]
+    static var notifyStalled: Bool {
+        get { bool("notify-stalled", default: true) }
+        set { d.set(newValue, forKey: "notify-stalled") }
+    }
+    static var shapePerAgent: Bool {
+        get { bool("shape-per-agent", default: true) }
+        set { d.set(newValue, forKey: "shape-per-agent") }
+    }
 }
+
+/// A working agent whose terminal has printed nothing for this long is
+/// treated as stalled: both Claude Code and Codex animate a spinner while a
+/// turn runs, so silence means the process is wedged.
+let noOutputStallInterval: TimeInterval = 90
 
 // MARK: - Agents
 
@@ -151,7 +176,10 @@ struct Agent {
     let path: String
     let jobName: String
     let sortKey: String
+    let tty: String
+    let lastOutput: Date?   // tty mtime; nil when the tty couldn't be stat'ed
     var since = Date()      // when the current status was first observed
+    var stallReason: String?   // non-nil => shown as stalled
 
     var projectName: String {
         let name = (path as NSString).lastPathComponent
@@ -163,11 +191,27 @@ struct Agent {
         if let detail, !detail.isEmpty { return detail }
         return jobName.isEmpty ? "agent" : jobName
     }
-    var state: DotState { DotState(status: status) }
+    var state: DotState { stallReason == nil ? DotState(status: status) : .stalled }
     var dotColor: NSColor { ColorStore.color(for: state) }
+    var statusText: String {
+        if let stallReason { return "stalled (\(stallReason))" }
+        return status
+    }
 
-    func elapsed(at now: Date = Date()) -> String {
-        let s = Int(now.timeIntervalSince(since))
+    /// Menu bar glyph: a shape per agent so Claude and Codex dots are
+    /// distinguishable at a glance (configurable off → all circles).
+    var glyph: String {
+        guard Prefs.shapePerAgent else { return "●" }
+        let n = agentName.lowercased()
+        if n.contains("claude") { return "●" }
+        if n.contains("codex") { return "◆" }
+        return "■"
+    }
+
+    func elapsed(at now: Date = Date()) -> String { Agent.format(now.timeIntervalSince(since)) }
+
+    static func format(_ interval: TimeInterval) -> String {
+        let s = max(0, Int(interval))
         if s < 60 { return "\(s)s" }
         if s < 3600 { return "\(s / 60)m" }
         return "\(s / 3600)h \(s % 3600 / 60)m"
@@ -214,13 +258,19 @@ func pollAgents() -> [Agent]? {
 
         let windowID = session["window_id"] as? String ?? ""
         let tabID = session["tab_id"] as? String ?? ""
+        // iTerm2 emits the path as "\/dev\/ttys000" (an extra backslash per slash).
+        let tty = (session["tty"] as? String ?? "").replacingOccurrences(of: "\\", with: "")
+        let lastOutput = tty.isEmpty ? nil :
+            (try? FileManager.default.attributesOfItem(atPath: tty))?[.modificationDate] as? Date
         agents.append(Agent(
             sessionID: id,
             status: status,
             detail: statusObj["detail"] as? String,
             path: path,
             jobName: jobName,
-            sortKey: "\(windowID)/\(tabID)/\(id)"
+            sortKey: "\(windowID)/\(tabID)/\(id)",
+            tty: tty,
+            lastOutput: lastOutput
         ))
     }
     return agents.sorted { $0.sortKey < $1.sortKey }
@@ -387,6 +437,39 @@ final class SettingsWindowController: NSObject {
             grid.addRow(with: [note, NSGridCell.emptyContentView])
         }
 
+        grid.addRow(with: [checkbox("When a working agent stalls",
+                                    on: Prefs.notifyStalled,
+                                    action: #selector(toggleNotifyStalled(_:))),
+                           NSGridCell.emptyContentView])
+
+        grid.addRow(with: [header("Stall detection"), NSGridCell.emptyContentView])
+        let stallPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        var stallChoices = Prefs.stallChoices
+        if !stallChoices.contains(Prefs.stallAfterMinutes) {
+            stallChoices.append(Prefs.stallAfterMinutes)
+            stallChoices.sort()
+        }
+        for m in stallChoices {
+            stallPopup.addItem(withTitle: m == 0 ? "Off" : "after \(m) min")
+            stallPopup.lastItem?.tag = m
+        }
+        stallPopup.selectItem(withTag: Prefs.stallAfterMinutes)
+        stallPopup.target = self
+        stallPopup.action = #selector(stallAfterChanged(_:))
+        grid.addRow(with: [NSTextField(labelWithString: "Flag long turns"), stallPopup])
+        let stallNote = NSTextField(wrappingLabelWithString:
+            "A working agent whose terminal prints nothing for \(Int(noOutputStallInterval))s is always flagged.")
+        stallNote.textColor = .secondaryLabelColor
+        stallNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        stallNote.preferredMaxLayoutWidth = 300
+        grid.addRow(with: [stallNote, NSGridCell.emptyContentView])
+
+        grid.addRow(with: [header("Appearance"), NSGridCell.emptyContentView])
+        grid.addRow(with: [checkbox("Shape per agent (● claude  ◆ codex  ■ other)",
+                                    on: Prefs.shapePerAgent,
+                                    action: #selector(toggleShapes(_:))),
+                           NSGridCell.emptyContentView])
+
         grid.addRow(with: [header("Keyboard"), NSGridCell.emptyContentView])
         grid.addRow(with: [checkbox("\(HotKey.display) focuses the next waiting agent",
                                     on: Prefs.hotkeyEnabled,
@@ -452,6 +535,20 @@ final class SettingsWindowController: NSObject {
 
     @objc private func toggleNotifyDone(_ sender: NSButton) {
         Prefs.notifyDone = sender.state == .on
+    }
+
+    @objc private func toggleNotifyStalled(_ sender: NSButton) {
+        Prefs.notifyStalled = sender.state == .on
+    }
+
+    @objc private func stallAfterChanged(_ sender: NSPopUpButton) {
+        Prefs.stallAfterMinutes = sender.selectedTag()
+        onChange()
+    }
+
+    @objc private func toggleShapes(_ sender: NSButton) {
+        Prefs.shapePerAgent = sender.state == .on
+        onChange()
     }
 
     @objc private func toggleHotkey(_ sender: NSButton) {
@@ -530,13 +627,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return polled.map { fresh in
             var agent = fresh
             let prev = previous[agent.sessionID]
+            let name = "\(agent.projectName) · \(agent.agentName)"
+            let attentionID = "attention-\(agent.sessionID)"
+            let stallID = "stalled-\(agent.sessionID)"
             if let prev, prev.status == agent.status {
                 agent.since = prev.since
+                agent.stallReason = stallReason(for: agent, at: now)
+                if agent.stallReason != nil, prev.stallReason == nil, Prefs.notifyStalled {
+                    notifier.post(id: stallID, title: name,
+                                  body: "Stalled: \(agent.stallReason!)", sessionID: agent.sessionID)
+                } else if agent.stallReason == nil, prev.stallReason != nil {
+                    notifier.remove(id: stallID)
+                }
                 return agent
             }
             agent.since = now
-            let name = "\(agent.projectName) · \(agent.agentName)"
-            let attentionID = "attention-\(agent.sessionID)"
+            if prev?.stallReason != nil { notifier.remove(id: stallID) }
             switch agent.status {
             case "waiting":
                 if Prefs.notifyAttention {
@@ -558,6 +664,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Why a working agent looks stuck, or nil if it doesn't.
+    func stallReason(for agent: Agent, at now: Date) -> String? {
+        guard agent.status == "working" else { return nil }
+        if let out = agent.lastOutput, now.timeIntervalSince(out) >= noOutputStallInterval {
+            return "no output for \(Agent.format(now.timeIntervalSince(out)))"
+        }
+        let limit = Prefs.stallAfterMinutes
+        if limit > 0, now.timeIntervalSince(agent.since) >= Double(limit) * 60 {
+            return "working for \(agent.elapsed(at: now))"
+        }
+        return nil
+    }
+
     func render() {
         guard let button = statusItem.button else { return }
         let shown = visibleAgents
@@ -573,7 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     .foregroundColor: agent.dotColor,
                     .kern: i == shown.count - 1 ? 0 : 2,
                 ]
-                title.append(NSAttributedString(string: "●", attributes: attrs))
+                title.append(NSAttributedString(string: agent.glyph, attributes: attrs))
             }
         }
         button.attributedTitle = title
@@ -600,11 +719,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.representedObject = agent.sessionID
 
                 let label = NSMutableAttributedString()
-                label.append(NSAttributedString(string: "● ", attributes: [
+                label.append(NSAttributedString(string: "\(agent.glyph) ", attributes: [
                     .foregroundColor: agent.dotColor,
                     .font: NSFont.menuFont(ofSize: 0),
                 ]))
-                let text = "\(agent.projectName) · \(agent.agentName) — \(agent.status)"
+                let text = "\(agent.projectName) · \(agent.agentName) — \(agent.statusText)"
                 label.append(NSAttributedString(string: text, attributes: [
                     .font: NSFont.menuFont(ofSize: 0),
                 ]))
