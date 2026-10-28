@@ -1,6 +1,6 @@
-// AgentMonitor — menu bar dots for Claude Code sessions in iTerm2.
+// AgentMonitor — menu bar dots for Claude Code and Codex sessions in iTerm2.
 //
-// One dot per Claude Code session, fed by iTerm2's cc-status hook data:
+// One dot per agent session, fed by iTerm2's per-session status store:
 //   green  = working
 //   yellow = attention needed (permission prompt / waiting on you)
 //   red    = stopped (done, idle, or error)
@@ -8,9 +8,12 @@
 // Polls `it2 session list` + `it2 session get-status` every 2 seconds.
 // Clicking an agent in the menu focuses its iTerm2 session.
 //
-// Build: swiftc -O AgentMonitor.swift -o AgentMonitor
+// Build: ./install.sh (wraps the binary in AgentMonitor.app — notifications
+// need a bundle identifier, so running the bare binary disables them).
 
 import Cocoa
+import Carbon.HIToolbox
+import UserNotifications
 
 // iTerm2's bundled CLI, checked in the standard install locations, then PATH.
 // If it resolves nowhere, polls fail and the menu shows "iTerm2 not reachable".
@@ -110,6 +113,37 @@ enum ColorStore {
     }
 }
 
+// MARK: - Preferences
+
+/// Behaviour toggles from the Settings window (UserDefaults; absent = default).
+enum Prefs {
+    private static let d = UserDefaults.standard
+    private static func bool(_ key: String, default def: Bool) -> Bool {
+        d.object(forKey: key) as? Bool ?? def
+    }
+
+    static var notifyAttention: Bool {
+        get { bool("notify-attention", default: true) }
+        set { d.set(newValue, forKey: "notify-attention") }
+    }
+    static var notifyDone: Bool {
+        get { bool("notify-done", default: true) }
+        set { d.set(newValue, forKey: "notify-done") }
+    }
+    static var hotkeyEnabled: Bool {
+        get { bool("hotkey-enabled", default: true) }
+        set { d.set(newValue, forKey: "hotkey-enabled") }
+    }
+    /// Minutes after which a stopped session disappears from the bar; 0 = never.
+    static var hideStoppedAfterMinutes: Int {
+        get { d.integer(forKey: "hide-stopped-after") }
+        set { d.set(newValue, forKey: "hide-stopped-after") }
+    }
+    static let hideStoppedChoices = [0, 1, 2, 5, 10, 30, 60]
+}
+
+// MARK: - Agents
+
 struct Agent {
     let sessionID: String
     let status: String      // working | waiting | done | idle | error
@@ -117,6 +151,7 @@ struct Agent {
     let path: String
     let jobName: String
     let sortKey: String
+    var since = Date()      // when the current status was first observed
 
     var projectName: String {
         let name = (path as NSString).lastPathComponent
@@ -128,7 +163,15 @@ struct Agent {
         if let detail, !detail.isEmpty { return detail }
         return jobName.isEmpty ? "agent" : jobName
     }
-    var dotColor: NSColor { ColorStore.color(for: DotState(status: status)) }
+    var state: DotState { DotState(status: status) }
+    var dotColor: NSColor { ColorStore.color(for: state) }
+
+    func elapsed(at now: Date = Date()) -> String {
+        let s = Int(now.timeIntervalSince(since))
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        return "\(s / 3600)h \(s % 3600 / 60)m"
+    }
 }
 
 // A session whose foreground job dropped back to a plain shell has no agent
@@ -183,11 +226,107 @@ func pollAgents() -> [Agent]? {
     return agents.sorted { $0.sortKey < $1.sortKey }
 }
 
+// MARK: - Notifications
+
+/// macOS notifications for status transitions. UNUserNotificationCenter aborts
+/// the process when there is no bundle identifier (bare binary), so everything
+/// is a no-op outside AgentMonitor.app.
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let available = Bundle.main.bundleIdentifier != nil
+    var onActivate: (String) -> Void = { _ in }
+
+    func setup() {
+        guard Notifier.available else {
+            NSLog("Notifications disabled: not running from an app bundle")
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error { NSLog("Notification authorization failed: \(error)") }
+            else if !granted { NSLog("Notifications not granted") }
+        }
+    }
+
+    func post(id: String, title: String, body: String, sessionID: String) {
+        guard Notifier.available else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["session": sessionID]
+        content.threadIdentifier = sessionID
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error { NSLog("Notification failed: \(error)") }
+        }
+    }
+
+    func remove(id: String) {
+        guard Notifier.available else { return }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let session = response.notification.request.content.userInfo["session"] as? String {
+            onActivate(session)
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler:
+                                    @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+}
+
+// MARK: - Global hotkey (Carbon; works without Accessibility permission)
+
+final class HotKey {
+    static let keyCode = UInt32(kVK_ANSI_A)
+    static let modifiers = UInt32(controlKey | optionKey)
+    static let display = "⌃⌥A"
+
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    var action: () -> Void = {}
+
+    func register() {
+        guard hotKeyRef == nil else { return }
+        if handlerRef == nil {
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                          eventKind: UInt32(kEventHotKeyPressed))
+            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+                guard let userData else { return noErr }
+                Unmanaged<HotKey>.fromOpaque(userData).takeUnretainedValue().action()
+                return noErr
+            }, 1, &eventType, selfPtr, &handlerRef)
+        }
+        let hotKeyID = EventHotKeyID(signature: 0x414D_4F4E /* 'AMON' */, id: 1)
+        let status = RegisterEventHotKey(HotKey.keyCode, HotKey.modifiers, hotKeyID,
+                                         GetApplicationEventTarget(), 0, &hotKeyRef)
+        if status != noErr { NSLog("RegisterEventHotKey failed: \(status)") }
+    }
+
+    func unregister() {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+    }
+}
+
 // MARK: - Settings window
 
 final class SettingsWindowController: NSObject {
     private var window: NSWindow?
     private var wells: [DotState: NSColorWell] = [:]
+    private var hidePopup: NSPopUpButton?
     var onChange: () -> Void = {}
 
     func show() {
@@ -197,15 +336,24 @@ final class SettingsWindowController: NSObject {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    private func header(_ text: String) -> NSTextField {
+        let h = NSTextField(labelWithString: text)
+        h.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
+        return h
+    }
+
+    private func checkbox(_ title: String, on: Bool, action: Selector) -> NSButton {
+        let b = NSButton(checkboxWithTitle: title, target: self, action: action)
+        b.state = on ? .on : .off
+        return b
+    }
+
     private func build() {
         let grid = NSGridView()
         grid.rowSpacing = 10
         grid.columnSpacing = 16
 
-        let header = NSTextField(labelWithString: "Dot colors")
-        header.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
-        grid.addRow(with: [header, NSGridCell.emptyContentView])
-
+        grid.addRow(with: [header("Dot colors"), NSGridCell.emptyContentView])
         for state in DotState.allCases {
             let label = NSTextField(labelWithString: state.label)
             let well = NSColorWell()
@@ -218,10 +366,54 @@ final class SettingsWindowController: NSObject {
             wells[state] = well
             grid.addRow(with: [label, well])
         }
-
         let reset = NSButton(title: "Reset to Defaults", target: self,
                              action: #selector(resetDefaults))
         grid.addRow(with: [reset, NSGridCell.emptyContentView])
+
+        grid.addRow(with: [header("Notifications"), NSGridCell.emptyContentView])
+        grid.addRow(with: [checkbox("When an agent needs attention",
+                                    on: Prefs.notifyAttention,
+                                    action: #selector(toggleNotifyAttention(_:))),
+                           NSGridCell.emptyContentView])
+        grid.addRow(with: [checkbox("When an agent finishes its turn",
+                                    on: Prefs.notifyDone,
+                                    action: #selector(toggleNotifyDone(_:))),
+                           NSGridCell.emptyContentView])
+        if !Notifier.available {
+            let note = NSTextField(wrappingLabelWithString:
+                "Notifications need the app bundle — rerun ./install.sh")
+            note.textColor = .secondaryLabelColor
+            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            grid.addRow(with: [note, NSGridCell.emptyContentView])
+        }
+
+        grid.addRow(with: [header("Keyboard"), NSGridCell.emptyContentView])
+        grid.addRow(with: [checkbox("\(HotKey.display) focuses the next waiting agent",
+                                    on: Prefs.hotkeyEnabled,
+                                    action: #selector(toggleHotkey(_:))),
+                           NSGridCell.emptyContentView])
+
+        grid.addRow(with: [header("Stopped sessions"), NSGridCell.emptyContentView])
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        var choices = Prefs.hideStoppedChoices
+        if !choices.contains(Prefs.hideStoppedAfterMinutes) {
+            choices.append(Prefs.hideStoppedAfterMinutes)
+            choices.sort()
+        }
+        for m in choices {
+            popup.addItem(withTitle: m == 0 ? "Never" : "after \(m) min")
+            popup.lastItem?.tag = m
+        }
+        popup.selectItem(withTag: Prefs.hideStoppedAfterMinutes)
+        popup.target = self
+        popup.action = #selector(hideStoppedChanged(_:))
+        hidePopup = popup
+        grid.addRow(with: [NSTextField(labelWithString: "Hide from the bar"), popup])
+
+        for row in 0..<grid.numberOfRows where grid.cell(atColumnIndex: 1, rowIndex: row).contentView == nil {
+            grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
+                            verticalRange: NSRange(location: row, length: 1))
+        }
 
         let container = NSView()
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -253,23 +445,58 @@ final class SettingsWindowController: NSObject {
         for (state, well) in wells { well.color = state.defaultColor }
         onChange()
     }
+
+    @objc private func toggleNotifyAttention(_ sender: NSButton) {
+        Prefs.notifyAttention = sender.state == .on
+    }
+
+    @objc private func toggleNotifyDone(_ sender: NSButton) {
+        Prefs.notifyDone = sender.state == .on
+    }
+
+    @objc private func toggleHotkey(_ sender: NSButton) {
+        Prefs.hotkeyEnabled = sender.state == .on
+        onChange()
+    }
+
+    @objc private func hideStoppedChanged(_ sender: NSPopUpButton) {
+        Prefs.hideStoppedAfterMinutes = sender.selectedTag()
+        onChange()
+    }
 }
+
+// MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
-    var agents: [Agent] = []
+    var agents: [Agent] = []          // everything the last poll returned
     var iterm2Reachable = true
+    var lastFocused: String?          // session the hotkey focused most recently
     let pollQueue = DispatchQueue(label: "agent-monitor.poll")
     let settings = SettingsWindowController()
+    let notifier = Notifier()
+    let hotKey = HotKey()
+
+    /// Agents shown in the bar and menu: stopped ones age out per Prefs.
+    var visibleAgents: [Agent] {
+        let limit = Prefs.hideStoppedAfterMinutes
+        guard limit > 0 else { return agents }
+        let cutoff = Date().addingTimeInterval(-Double(limit) * 60)
+        return agents.filter { $0.state != .stopped || $0.since > cutoff }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        settings.onChange = { [weak self] in self?.render() }
+        settings.onChange = { [weak self] in self?.applyPrefs() }
+        notifier.onActivate = { [weak self] session in self?.focus(sessionID: session) }
+        notifier.setup()
+        hotKey.action = { [weak self] in self?.focusNextWaiting() }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        render()
+        applyPrefs()
 
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.poll()
@@ -278,31 +505,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         poll()
     }
 
+    func applyPrefs() {
+        if Prefs.hotkeyEnabled { hotKey.register() } else { hotKey.unregister() }
+        render()
+    }
+
     func poll() {
         pollQueue.async { [weak self] in
             let result = pollAgents()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.iterm2Reachable = (result != nil)
-                self.agents = result ?? []
+                self.agents = self.track(result ?? [])
                 self.render()
             }
         }
     }
 
+    /// Carries `since` over for unchanged statuses and fires notifications on
+    /// transitions. Runs on the main thread.
+    func track(_ polled: [Agent]) -> [Agent] {
+        let previous = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
+        let now = Date()
+        return polled.map { fresh in
+            var agent = fresh
+            let prev = previous[agent.sessionID]
+            if let prev, prev.status == agent.status {
+                agent.since = prev.since
+                return agent
+            }
+            agent.since = now
+            let name = "\(agent.projectName) · \(agent.agentName)"
+            let attentionID = "attention-\(agent.sessionID)"
+            switch agent.status {
+            case "waiting":
+                if Prefs.notifyAttention {
+                    notifier.post(id: attentionID, title: name,
+                                  body: "Needs your attention", sessionID: agent.sessionID)
+                }
+            case "done":
+                notifier.remove(id: attentionID)
+                // Only a turn we watched run counts; a session first seen as
+                // "done" (e.g. right after the app started) is old news.
+                if let prev, prev.state != .stopped, Prefs.notifyDone {
+                    notifier.post(id: "done-\(agent.sessionID)", title: name,
+                                  body: "Finished its turn", sessionID: agent.sessionID)
+                }
+            default:
+                notifier.remove(id: attentionID)
+            }
+            return agent
+        }
+    }
+
     func render() {
         guard let button = statusItem.button else { return }
+        let shown = visibleAgents
         let title = NSMutableAttributedString()
         let font = NSFont.systemFont(ofSize: 14, weight: .bold)
-        if agents.isEmpty {
+        if shown.isEmpty {
             let dim = NSColor.secondaryLabelColor
             title.append(NSAttributedString(string: "○", attributes: [.font: font, .foregroundColor: dim]))
         } else {
-            for (i, agent) in agents.enumerated() {
+            for (i, agent) in shown.enumerated() {
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: font,
                     .foregroundColor: agent.dotColor,
-                    .kern: i == agents.count - 1 ? 0 : 2,
+                    .kern: i == shown.count - 1 ? 0 : 2,
                 ]
                 title.append(NSAttributedString(string: "●", attributes: attrs))
             }
@@ -313,14 +582,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Rebuild the dropdown each time it opens, from the latest poll.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        let shown = visibleAgents
+        let hidden = agents.count - shown.count
 
         if !iterm2Reachable {
             menu.addItem(disabledItem("iTerm2 not reachable"))
-        } else if agents.isEmpty {
-            menu.addItem(disabledItem("No active Claude Code sessions"))
+        } else if shown.isEmpty {
+            menu.addItem(disabledItem("No active agent sessions"))
         } else {
-            for agent in agents {
-                let item = NSMenuItem(title: "", action: #selector(focusAgent(_:)), keyEquivalent: "")
+            let now = Date()
+            for (i, agent) in shown.enumerated() {
+                // Digits 1–9 pick a row while the menu is open.
+                let key = i < 9 ? String(i + 1) : ""
+                let item = NSMenuItem(title: "", action: #selector(focusAgent(_:)), keyEquivalent: key)
+                item.keyEquivalentModifierMask = []
                 item.target = self
                 item.representedObject = agent.sessionID
 
@@ -333,12 +608,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 label.append(NSAttributedString(string: text, attributes: [
                     .font: NSFont.menuFont(ofSize: 0),
                 ]))
+                label.append(NSAttributedString(string: "  \(agent.elapsed(at: now))", attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]))
                 item.attributedTitle = label
                 menu.addItem(item)
             }
         }
+        if hidden > 0 {
+            menu.addItem(disabledItem("\(hidden) stopped session\(hidden == 1 ? "" : "s") hidden"))
+        }
 
         menu.addItem(.separator())
+        let next = NSMenuItem(title: "Focus Next Waiting Agent", action: #selector(focusNextWaitingItem),
+                              keyEquivalent: Prefs.hotkeyEnabled ? "a" : "")
+        next.keyEquivalentModifierMask = [.control, .option]
+        next.target = self
+        next.isEnabled = !shown.isEmpty
+        menu.addItem(next)
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -350,6 +638,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.show()
     }
 
+    @objc func focusNextWaitingItem() {
+        focusNextWaiting()
+    }
+
     func disabledItem(_ title: String) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
@@ -358,6 +650,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func focusAgent(_ sender: NSMenuItem) {
         guard let sessionID = sender.representedObject as? String else { return }
+        focus(sessionID: sessionID)
+    }
+
+    /// Cycles through agents needing attention; with none waiting, through all
+    /// visible agents, so the shortcut always lands somewhere useful.
+    func focusNextWaiting() {
+        let shown = visibleAgents
+        var candidates = shown.filter { $0.state == .attention }
+        if candidates.isEmpty { candidates = shown }
+        guard !candidates.isEmpty else { return }
+        var index = 0
+        if let last = lastFocused, let i = candidates.firstIndex(where: { $0.sessionID == last }) {
+            index = (i + 1) % candidates.count
+        }
+        focus(sessionID: candidates[index].sessionID)
+    }
+
+    func focus(sessionID: String) {
+        lastFocused = sessionID
         pollQueue.async {
             _ = runIt2(["session", "focus", "-s", sessionID])
         }

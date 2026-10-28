@@ -10,9 +10,19 @@ and **Codex CLI** sessions running in iTerm2.
 - 🔴 **red** — stopped (turn done, idle, interrupted, or error)
 - ○ gray hollow — no active agent sessions
 
-Click the dots for a dropdown listing each agent (`project · claude — working`,
-`project · codex — waiting`, …). Clicking an agent focuses its iTerm2 session and
-brings iTerm2 forward.
+Click the dots for a dropdown listing each agent (`project · claude — working  4m`,
+`project · codex — waiting  12s`, …) with how long it has been in that state.
+Clicking an agent focuses its iTerm2 session and brings iTerm2 forward; while the
+menu is open, keys `1`–`9` pick a row.
+
+- **Notifications**: a macOS notification when an agent needs attention or
+  finishes a turn (each togglable in Settings). Clicking it focuses the session.
+  macOS asks once for notification permission on first launch.
+- **Global shortcut** `⌃⌥A`: focuses the next agent waiting on you, cycling
+  through them; with none waiting, cycles through all agents. Can be disabled
+  in Settings.
+- **Hide stopped sessions**: Settings can age stopped (red) sessions out of
+  the bar after 1–60 minutes; the dropdown shows how many are hidden.
 
 Dot colors are customizable: **Settings…** in the dropdown opens a window with a
 color well per state (working / attention needed / stopped) and a reset button.
@@ -79,7 +89,7 @@ October 2026.
 ./install.sh
 ```
 
-This builds the app, installs the Codex hook (`~/.codex/hooks/codex-status` +
+This builds `AgentMonitor.app`, installs the Codex hook (`~/.codex/hooks/codex-status` +
 `~/.codex/hooks.json`), and registers a LaunchAgent so the app starts at login.
 
 If you already have a `~/.codex/hooks.json`, the installer leaves it untouched —
@@ -105,6 +115,10 @@ launchctl kickstart -k gui/$UID/com.forloops.agent-monitor     # just restart
 
 ## Troubleshooting
 
+- **No notifications**: System Settings → Notifications → Agent Monitor must be
+  allowed, and the app must be running from `AgentMonitor.app` (rerun
+  `./install.sh`; `/tmp/agent-monitor.log` says "not running from an app bundle"
+  otherwise).
 - **No dots at all** (not even ○): check `/tmp/agent-monitor.log` and that the
   LaunchAgent is loaded: `launchctl print gui/$UID/com.forloops.agent-monitor`.
 - **"iTerm2 not reachable" while iTerm2 is running**: enable iTerm2's Python API
@@ -121,6 +135,7 @@ launchctl kickstart -k gui/$UID/com.forloops.agent-monitor     # just restart
 
 ```
 AgentMonitor.swift    # the menu bar app (single file, no dependencies)
+AgentMonitor.app/     # built by install.sh (gitignored)
 codex/codex-status    # Codex lifecycle hook -> it2 session set-status
 install.sh            # build + install hook, hooks.json, LaunchAgent
 uninstall.sh          # remove LaunchAgent + Codex hook

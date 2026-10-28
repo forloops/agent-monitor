@@ -8,8 +8,41 @@ LABEL="com.forloops.agent-monitor"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CODEX_HOOK="$HOME/.codex/hooks/codex-status"
 
-echo "==> Building AgentMonitor"
-swiftc -O "$REPO_DIR/AgentMonitor.swift" -o "$REPO_DIR/AgentMonitor"
+APP="$REPO_DIR/AgentMonitor.app"
+BIN="$APP/Contents/MacOS/AgentMonitor"
+
+echo "==> Building AgentMonitor.app"
+# A real bundle (with a bundle identifier) is required for macOS notifications;
+# a bare binary runs fine but can't post them.
+mkdir -p "$APP/Contents/MacOS"
+swiftc -O "$REPO_DIR/AgentMonitor.swift" -o "$BIN"
+cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>$LABEL</string>
+    <key>CFBundleName</key>
+    <string>Agent Monitor</string>
+    <key>CFBundleExecutable</key>
+    <string>AgentMonitor</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+# Ad-hoc signature so macOS keeps a stable identity for the notification permission.
+codesign --force --sign - "$APP" 2>/dev/null || echo "    (codesign unavailable; continuing unsigned)"
+rm -f "$REPO_DIR/AgentMonitor"   # pre-bundle binary from older installs
 
 echo "==> Installing Codex hook"
 mkdir -p "$HOME/.codex/hooks"
@@ -66,7 +99,7 @@ cat > "$PLIST" <<EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$REPO_DIR/AgentMonitor</string>
+        <string>$BIN</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -86,3 +119,4 @@ EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "==> Done. Look for the dots in your menu bar."
+echo "    macOS will ask once whether Agent Monitor may send notifications — allow it."

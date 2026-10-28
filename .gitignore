@@ -1,4 +1,5 @@
 AgentMonitor
+AgentMonitor.app/
 *.log
 .DS_Store
 __pycache__/

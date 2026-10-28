@@ -30,9 +30,13 @@ the `codex-status` command into it for the events listed in the README.
   `~/.codex/hooks/` — then rerun `./install.sh` and warn the user that Codex
   will require one re-trust (step 1 above).
 - After editing `AgentMonitor.swift`, rerun `./install.sh` (or
-  `swiftc -O AgentMonitor.swift -o AgentMonitor &&
+  `swiftc -O AgentMonitor.swift -o AgentMonitor.app/Contents/MacOS/AgentMonitor &&
   launchctl kickstart -k gui/$UID/com.forloops.agent-monitor`).
-- The compiled `AgentMonitor` binary is gitignored; never commit it.
+- The app must run from `AgentMonitor.app` (built by `install.sh`) for
+  notifications to work; `UNUserNotificationCenter` needs a bundle identifier
+  and the code no-ops without one. The bundle is gitignored; never commit it.
+- Status transitions (notifications, elapsed time, hide-stopped) are tracked
+  in-app from poll to poll — iTerm2's status store has no timestamps.
 
 ## Verifying
 
