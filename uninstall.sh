@@ -13,4 +13,4 @@ rm -f "$HOME/.codex/hooks/codex-status"
 rm -rf "$HOME/.agent-monitor" && echo "Removed ~/.agent-monitor (hook + session store)."
 
 echo
-echo "Left in place: iTerm2's own cc-status entries in ~/.claude/settings.json."
+echo "Left in place: iTerm2's own cc-status entries in Claude's settings.json files."

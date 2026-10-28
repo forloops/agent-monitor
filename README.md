@@ -102,8 +102,11 @@ October 2026.
 This builds `AgentMonitor.app`, installs the hook to `~/.agent-monitor/agent-status`,
 registers it in `~/.claude/settings.json` and `~/.codex/hooks.json` (existing
 entries are preserved; a one-time `.bak` of each file is kept), and registers a
-LaunchAgent so the app starts at login. Already-running agent sessions pick up
-the hook when restarted.
+LaunchAgent so the app starts at login. Claude Code profiles kept in other config
+dirs (`CLAUDE_CONFIG_DIR=~/.claude-work claude`) get the hook too: every
+`~/.claude-*` directory containing `settings.json` or `.claude.json` is
+registered, as is `$CLAUDE_CONFIG_DIR` if set when you run the installer.
+Already-running agent sessions pick up the hook when restarted.
 
 ### Codex one-time trust step
 
@@ -134,8 +137,10 @@ launchctl kickstart -k gui/$UID/com.forloops.agent-monitor     # just restart
   iTerm2 prompts for it.
 - **A session shows no dot**: `/tmp/agent-monitor-hook.log` gets a line per
   hook event. Nothing there while the agent runs means the hook isn't
-  registered (check `~/.claude/settings.json` / `~/.codex/hooks.json` for
-  `agent-status`) or, for Codex, isn't trusted yet (see the trust step above).
+  registered (check `~/.claude/settings.json` — or the profile's own
+  `settings.json` — and `~/.codex/hooks.json` for `agent-status`; a profile dir
+  outside `~/.claude-*` needs `./install.sh` run with its `CLAUDE_CONFIG_DIR`
+  set) or, for Codex, isn't trusted yet (see the trust step above).
   Sessions started before `./install.sh` need a restart to load the hook.
 - **Inspect stored state directly**: `cat ~/.agent-monitor/sessions/*.json`.
 - **Clicking a row doesn't select the pane**: the app only activates the
